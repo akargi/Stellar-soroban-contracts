@@ -14,6 +14,9 @@ use insurance_contracts::authorization::{
     require_trusted_contract, register_trusted_contract, Role, get_role
 };
 
+// Import invariants and safety assertions
+use insurance_invariants::{InvariantError, ProtocolInvariants};
+
 // Oracle validation types
 use soroban_sdk::contracttype;
 
@@ -56,6 +59,11 @@ pub enum ContractError {
     InvalidRole = 15,
     RoleNotFound = 16,
     NotTrustedContract = 17,
+    // Invariant violation errors (100-199)
+    InvalidClaimState = 102,
+    InvalidAmount = 103,
+    CoverageExceeded = 105,
+    Overflow = 107,
 }
 
 impl From<insurance_contracts::authorization::AuthError> for ContractError {
@@ -65,6 +73,18 @@ impl From<insurance_contracts::authorization::AuthError> for ContractError {
             insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
             insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
             insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
+}
+
+impl From<InvariantError> for ContractError {
+    fn from(err: InvariantError) -> Self {
+        match err {
+            InvariantError::InvalidClaimState => ContractError::InvalidClaimState,
+            InvariantError::InvalidAmount => ContractError::InvalidAmount,
+            InvariantError::CoverageExceeded => ContractError::CoverageExceeded,
+            InvariantError::Overflow => ContractError::Overflow,
+            _ => ContractError::InvalidState,
         }
     }
 }
@@ -84,6 +104,36 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage()
         .persistent()
         .set(&PAUSED, &paused);
+}
+
+/// I3: Validate claim state transition
+/// Maps valid state transitions to ensure claim lifecycle integrity
+fn is_valid_state_transition(current: ClaimStatus, next: ClaimStatus) -> bool {
+    match (&current, &next) {
+        // Valid forward transitions
+        (ClaimStatus::Submitted, ClaimStatus::UnderReview) => true,
+        (ClaimStatus::UnderReview, ClaimStatus::Approved) => true,
+        (ClaimStatus::UnderReview, ClaimStatus::Rejected) => true,
+        (ClaimStatus::Approved, ClaimStatus::Settled) => true,
+        // Invalid transitions (backward, skipping, etc.)
+        _ => false,
+    }
+}
+
+/// I4: Validate amount is positive and within safe range
+fn validate_amount(amount: i128) -> Result<(), ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+    Ok(())
+}
+
+/// I6: Validate claim does not exceed coverage limit
+fn validate_coverage_constraint(claim_amount: i128, coverage_amount: i128) -> Result<(), ContractError> {
+    if claim_amount > coverage_amount {
+        return Err(ContractError::CoverageExceeded);
+    }
+    Ok(())
 }
 
 #[contractimpl]
@@ -222,6 +272,9 @@ impl ClaimsContract {
             return Err(ContractError::Paused);
         }
 
+        // I4: Amount Non-Negativity - amount must be positive
+        validate_amount(amount)?;
+
         // 2. FETCH POLICY DATA (Temporarily disabled - requires policy WASM)
         let (_policy_contract_addr, _): (Address, Address) = env.storage()
             .persistent()
@@ -243,23 +296,21 @@ impl ClaimsContract {
             return Err(ContractError::AlreadyExists);
         }
 
-        // 5. COVERAGE CHECK (Enforce claim ≤ coverage)
-        // TODO: Uncomment when policy client is available
-        // if amount <= 0 || amount > policy.1 {
-        //     return Err(ContractError::InvalidInput);
-        // }
-        if amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        // 5. I6: COVERAGE CHECK (Enforce claim ≤ coverage)
+        // TODO: Uncomment when policy client is available with coverage_amount
+        // validate_coverage_constraint(amount, policy.1)?;
 
         // ID Generation
         let seq: u64 = env.ledger().sequence().into();
         let claim_id = seq + 1; 
         let current_time = env.ledger().timestamp();
 
+        // I3: Initial state must be Submitted
+        let initial_status = ClaimStatus::Submitted;
+
         env.storage()
             .persistent()
-            .set(&(CLAIM, claim_id), &(policy_id, claimant.clone(), amount, ClaimStatus::Submitted, current_time));
+            .set(&(CLAIM, claim_id), &(policy_id, claimant.clone(), amount, initial_status, current_time));
         
         env.storage()
             .persistent()
@@ -294,9 +345,14 @@ impl ClaimsContract {
             .get(&(CLAIM, claim_id))
             .ok_or(ContractError::NotFound)?;
 
-        // Can only approve claims that are UnderReview
-        if claim.3 != ClaimStatus::UnderReview {
-            return Err(ContractError::InvalidState);
+        // I3: Can only approve claims that are UnderReview - validate state transition
+        if !is_valid_state_transition(claim.3.clone(), ClaimStatus::Approved) {
+            return Err(ContractError::InvalidClaimState);
+        }
+
+        // I4: Amount must be positive
+        if claim.2 <= 0 {
+            return Err(ContractError::InvalidAmount);
         }
 
         // Check if oracle validation is required
@@ -339,6 +395,7 @@ impl ClaimsContract {
             (claim_id, claim.2).into_val(&env),
         );
 
+        // I3: Transition to Approved state
         claim.3 = ClaimStatus::Approved;
 
         env.storage()
@@ -364,11 +421,12 @@ impl ClaimsContract {
             .get(&(CLAIM, claim_id))
             .ok_or(ContractError::NotFound)?;
 
-        // Can only start review for submitted claims
-        if claim.3 != ClaimStatus::Submitted {
-            return Err(ContractError::InvalidState);
+        // I3: Can only start review for submitted claims - validate state transition
+        if !is_valid_state_transition(claim.3.clone(), ClaimStatus::UnderReview) {
+            return Err(ContractError::InvalidClaimState);
         }
 
+        // I3: Transition to UnderReview state
         claim.3 = ClaimStatus::UnderReview;
 
         env.storage()
@@ -394,11 +452,12 @@ impl ClaimsContract {
             .get(&(CLAIM, claim_id))
             .ok_or(ContractError::NotFound)?;
 
-        // Can only reject claims that are UnderReview
-        if claim.3 != ClaimStatus::UnderReview {
-            return Err(ContractError::InvalidState);
+        // I3: Can only reject claims that are UnderReview - validate state transition
+        if !is_valid_state_transition(claim.3.clone(), ClaimStatus::Rejected) {
+            return Err(ContractError::InvalidClaimState);
         }
 
+        // I3: Transition to Rejected state
         claim.3 = ClaimStatus::Rejected;
 
         env.storage()
@@ -424,9 +483,14 @@ impl ClaimsContract {
             .get(&(CLAIM, claim_id))
             .ok_or(ContractError::NotFound)?;
 
-        // Can only settle claims that are Approved
-        if claim.3 != ClaimStatus::Approved {
-            return Err(ContractError::InvalidState);
+        // I3: Can only settle claims that are Approved - validate state transition
+        if !is_valid_state_transition(claim.3.clone(), ClaimStatus::Settled) {
+            return Err(ContractError::InvalidClaimState);
+        }
+
+        // I4: Amount must be positive
+        if claim.2 <= 0 {
+            return Err(ContractError::InvalidAmount);
         }
 
         // Get risk pool contract address from config
@@ -447,6 +511,7 @@ impl ClaimsContract {
             (claim_id, claim.1.clone()).into_val(&env),
         );
 
+        // I3: Transition to Settled state
         claim.3 = ClaimStatus::Settled;
 
         env.storage()
