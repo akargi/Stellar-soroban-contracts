@@ -10,6 +10,14 @@ use insurance_contracts::authorization::{
 // Import invariant checks and error types
 use insurance_invariants::{InvariantError, ProtocolInvariants};
 
+// Policy validation constants
+const MIN_COVERAGE_AMOUNT: i128 = 1_000_000; // 1 unit (assuming 6 decimals)
+const MAX_COVERAGE_AMOUNT: i128 = 1_000_000_000_000_000; // 1M units
+const MIN_PREMIUM_AMOUNT: i128 = 100_000; // 0.1 units
+const MAX_PREMIUM_AMOUNT: i128 = 100_000_000_000_000; // 100k units
+const MIN_POLICY_DURATION_DAYS: u32 = 1;
+const MAX_POLICY_DURATION_DAYS: u32 = 365;
+
 #[contract]
 pub struct PolicyContract;
 
@@ -20,6 +28,12 @@ pub enum DataKey {
     Config,
     Policy(u64),
     PolicyCounter,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub risk_pool: Address,
 }
 
 // Step 1: Define the Policy State Enum
@@ -36,7 +50,7 @@ pub enum PolicyState {
 // Step 2: Define Allowed State Transitions
 impl PolicyState {
     /// Validates whether a transition from the current state to the next state is allowed.
-    /// 
+    ///
     /// Valid transitions:
     /// - Active → Expired
     /// - Active → Cancelled
@@ -53,6 +67,81 @@ impl PolicyState {
             // Self-transitions are not allowed
             _ => false,
         }
+    }
+}
+
+// Step 3: Define the Policy Struct
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Policy {
+    pub holder: Address,
+    pub coverage_amount: i128,
+    pub premium_amount: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    state: PolicyState,  // Private - controlled through methods
+    pub created_at: u64,
+}
+
+// Step 4: Implement Policy Methods
+impl Policy {
+    /// Creates a new policy in Active state
+    pub fn new(
+        holder: Address,
+        coverage_amount: i128,
+        premium_amount: i128,
+        start_time: u64,
+        end_time: u64,
+        created_at: u64,
+    ) -> Self {
+        Policy {
+            holder,
+            coverage_amount,
+            premium_amount,
+            start_time,
+            end_time,
+            state: PolicyState::Active,
+            created_at,
+        }
+    }
+
+    /// Returns the current state (read-only)
+    pub fn state(&self) -> PolicyState {
+        self.state
+    }
+
+    /// Attempts to transition to a new state
+    pub fn transition_to(&mut self, next: PolicyState) -> Result<(), ContractError> {
+        if !self.state.can_transition_to(next) {
+            return Err(ContractError::InvalidStateTransition);
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    /// Cancels the policy (only if Active)
+    pub fn cancel(&mut self) -> Result<(), ContractError> {
+        self.transition_to(PolicyState::Cancelled)
+    }
+
+    /// Expires the policy (only if Active)
+    pub fn expire(&mut self) -> Result<(), ContractError> {
+        self.transition_to(PolicyState::Expired)
+    }
+
+    /// Checks if the policy is active
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, PolicyState::Active)
+    }
+
+    /// Checks if the policy is expired
+    pub fn is_expired(&self) -> bool {
+        matches!(self.state, PolicyState::Expired)
+    }
+
+    /// Checks if the policy is cancelled
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.state, PolicyState::Cancelled)
     }
 }
 
@@ -163,18 +252,26 @@ fn is_valid_policy_state_transition(current: PolicyStatus, next: PolicyStatus) -
     }
 }
 
-/// I4: Validate amount is positive
-fn validate_amount(amount: i128) -> Result<(), ContractError> {
-    if amount <= 0 {
+/// I4: Validate coverage amount within bounds
+fn validate_coverage_amount(amount: i128) -> Result<(), ContractError> {
+    if amount < MIN_COVERAGE_AMOUNT || amount > MAX_COVERAGE_AMOUNT {
         return Err(ContractError::InvalidAmount);
     }
     Ok(())
 }
 
-/// I7: Validate premium is positive for active policies
-fn validate_premium(premium: i128) -> Result<(), ContractError> {
-    if premium <= 0 {
+/// I7: Validate premium amount within bounds
+fn validate_premium_amount(premium: i128) -> Result<(), ContractError> {
+    if premium < MIN_PREMIUM_AMOUNT || premium > MAX_PREMIUM_AMOUNT {
         return Err(ContractError::InvalidPremium);
+    }
+    Ok(())
+}
+
+/// Validate policy duration
+fn validate_duration(duration_days: u32) -> Result<(), ContractError> {
+    if duration_days < MIN_POLICY_DURATION_DAYS || duration_days > MAX_POLICY_DURATION_DAYS {
+        return Err(ContractError::InvalidInput);
     }
     Ok(())
 }
@@ -232,15 +329,14 @@ impl PolicyContract {
 
         validate_address(&env, &holder)?;
 
-        // I4: Amount Non-Negativity - coverage must be positive
-        validate_amount(coverage_amount)?;
+        // Validate coverage amount within bounds
+        validate_coverage_amount(coverage_amount)?;
 
-        // I7: Premium Validity - premium must be positive for active policies
-        validate_premium(premium_amount)?;
+        // Validate premium amount within bounds
+        validate_premium_amount(premium_amount)?;
 
-        if duration_days == 0 || duration_days > 365 {
-            return Err(ContractError::InvalidInput);
-        }
+        // Validate duration within bounds
+        validate_duration(duration_days)?;
 
         let policy_id = next_policy_id(&env);
         let current_time = env.ledger().timestamp();
@@ -261,8 +357,8 @@ impl PolicyContract {
             .set(&DataKey::Policy(policy_id), &policy);
 
         env.events().publish(
-            (Symbol::new(&env, "policy_issued"), policy_id),
-            (holder, coverage_amount, premium_amount, duration_days),
+            (Symbol::new(&env, "PolicyIssued"), policy_id),
+            (holder, coverage_amount, premium_amount, duration_days, manager, current_time),
         );
 
         Ok(policy_id)
@@ -465,5 +561,227 @@ impl PolicyContract {
     /// Get the role of an address
     pub fn get_user_role(env: Env, address: Address) -> Role {
         get_role(&env, &address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Env as _};
+
+    #[test]
+    fn test_valid_policy_issuance() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        // Initialize contract
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+
+        // Grant manager role
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        // Issue policy
+        let coverage = MIN_COVERAGE_AMOUNT + 1000;
+        let premium = MIN_PREMIUM_AMOUNT + 100;
+        let duration = 30;
+
+        let policy_id = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        assert_eq!(policy_id, 1);
+
+        // Verify policy
+        let policy = PolicyContract::get_policy(env.clone(), policy_id).unwrap();
+        assert_eq!(policy.holder, holder);
+        assert_eq!(policy.coverage_amount, coverage);
+        assert_eq!(policy.premium_amount, premium);
+        assert_eq!(policy.state(), PolicyState::Active);
+    }
+
+    #[test]
+    fn test_invalid_coverage_too_low() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MIN_COVERAGE_AMOUNT - 1,
+            MIN_PREMIUM_AMOUNT + 100,
+            30,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_invalid_coverage_too_high() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MAX_COVERAGE_AMOUNT + 1,
+            MIN_PREMIUM_AMOUNT + 100,
+            30,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_invalid_premium_too_low() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MIN_COVERAGE_AMOUNT + 1000,
+            MIN_PREMIUM_AMOUNT - 1,
+            30,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidPremium));
+    }
+
+    #[test]
+    fn test_invalid_premium_too_high() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MIN_COVERAGE_AMOUNT + 1000,
+            MAX_PREMIUM_AMOUNT + 1,
+            30,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidPremium));
+    }
+
+    #[test]
+    fn test_invalid_duration_too_short() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MIN_COVERAGE_AMOUNT + 1000,
+            MIN_PREMIUM_AMOUNT + 100,
+            MIN_POLICY_DURATION_DAYS - 1,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_invalid_duration_too_long() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let result = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            MIN_COVERAGE_AMOUNT + 1000,
+            MIN_PREMIUM_AMOUNT + 100,
+            MAX_POLICY_DURATION_DAYS + 1,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_duplicate_policy_issuance_not_possible() {
+        // Since policy IDs are unique via counter, duplicate issuance isn't possible
+        // This test ensures the counter increments properly
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let holder = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+
+        PolicyContract::initialize(env.clone(), admin.clone(), risk_pool.clone()).unwrap();
+        PolicyContract::grant_manager_role(env.clone(), admin.clone(), manager.clone()).unwrap();
+
+        let coverage = MIN_COVERAGE_AMOUNT + 1000;
+        let premium = MIN_PREMIUM_AMOUNT + 100;
+        let duration = 30;
+
+        let policy_id1 = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        let policy_id2 = PolicyContract::issue_policy(
+            env.clone(),
+            manager.clone(),
+            holder.clone(),
+            coverage,
+            premium,
+            duration,
+        ).unwrap();
+
+        assert_eq!(policy_id1, 1);
+        assert_eq!(policy_id2, 2);
+        assert_ne!(policy_id1, policy_id2);
     }
 }
