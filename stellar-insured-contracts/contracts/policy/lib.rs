@@ -7,6 +7,9 @@ use insurance_contracts::authorization::{
     register_trusted_contract, Role, get_role
 };
 
+// Import invariant checks and error types
+use insurance_invariants::{InvariantError, ProtocolInvariants};
+
 #[contract]
 pub struct PolicyContract;
 
@@ -62,6 +65,11 @@ pub enum ContractError {
     InvalidRole = 11,
     RoleNotFound = 12,
     NotTrustedContract = 13,
+    // Invariant violation errors (100-199)
+    InvalidPolicyState = 101,
+    InvalidAmount = 103,
+    InvalidPremium = 106,
+    Overflow2 = 107,
 }
 
 impl From<insurance_contracts::authorization::AuthError> for ContractError {
@@ -71,6 +79,18 @@ impl From<insurance_contracts::authorization::AuthError> for ContractError {
             insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
             insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
             insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
+}
+
+impl From<InvariantError> for ContractError {
+    fn from(err: InvariantError) -> Self {
+        match err {
+            InvariantError::InvalidPolicyState => ContractError::InvalidPolicyState,
+            InvariantError::InvalidAmount => ContractError::InvalidAmount,
+            InvariantError::InvalidPremium => ContractError::InvalidPremium,
+            InvariantError::Overflow => ContractError::Overflow2,
+            _ => ContractError::InvalidState,
         }
     }
 }
@@ -103,6 +123,37 @@ fn next_policy_id(env: &Env) -> u64 {
         .persistent()
         .set(&DataKey::PolicyCounter, &next_id);
     next_id
+}
+
+/// I2: Validate policy state transition
+/// Maps valid state transitions for policy lifecycle:
+/// Active -> Expired (time-based), Cancelled, or Claimed
+fn is_valid_policy_state_transition(current: PolicyStatus, next: PolicyStatus) -> bool {
+    match (&current, &next) {
+        // Valid forward transitions
+        (PolicyStatus::Active, PolicyStatus::Expired) => true,
+        (PolicyStatus::Active, PolicyStatus::Cancelled) => true,
+        (PolicyStatus::Active, PolicyStatus::Claimed) => true,
+        (PolicyStatus::Expired, PolicyStatus::Claimed) => true,
+        // Invalid transitions
+        _ => false,
+    }
+}
+
+/// I4: Validate amount is positive
+fn validate_amount(amount: i128) -> Result<(), ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+    Ok(())
+}
+
+/// I7: Validate premium is positive for active policies
+fn validate_premium(premium: i128) -> Result<(), ContractError> {
+    if premium <= 0 {
+        return Err(ContractError::InvalidPremium);
+    }
+    Ok(())
 }
 
 #[contractimpl]
@@ -158,9 +209,11 @@ impl PolicyContract {
 
         validate_address(&env, &holder)?;
 
-        if coverage_amount <= 0 || premium_amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        // I4: Amount Non-Negativity - coverage must be positive
+        validate_amount(coverage_amount)?;
+
+        // I7: Premium Validity - premium must be positive for active policies
+        validate_premium(premium_amount)?;
 
         if duration_days == 0 || duration_days > 365 {
             return Err(ContractError::InvalidInput);
@@ -168,7 +221,7 @@ impl PolicyContract {
 
         let policy_id = next_policy_id(&env);
         let current_time = env.ledger().timestamp();
-        let end_time = current_time + (duration_days as u64 * 86400);
+        let end_time = current_time.checked_add(u64::from(duration_days).checked_mul(86400).ok_or(ContractError::Overflow2)?).ok_or(ContractError::Overflow2)?;
 
         let policy = Policy {
             holder: holder.clone(),

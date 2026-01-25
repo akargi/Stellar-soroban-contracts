@@ -7,6 +7,9 @@ use insurance_contracts::authorization::{
     require_trusted_contract, register_trusted_contract, Role, get_role
 };
 
+// Import invariant checks and error types
+use insurance_invariants::{InvariantError, ProtocolInvariants};
+
 #[contract]
 pub struct RiskPoolContract;
 
@@ -32,6 +35,10 @@ pub enum ContractError {
     InvalidRole = 11,
     RoleNotFound = 12,
     NotTrustedContract = 13,
+    // Invariant violation errors (100-199)
+    LiquidityViolation = 100,
+    InvalidAmount = 103,
+    Overflow = 107,
 }
 
 impl From<insurance_contracts::authorization::AuthError> for ContractError {
@@ -41,6 +48,17 @@ impl From<insurance_contracts::authorization::AuthError> for ContractError {
             insurance_contracts::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
             insurance_contracts::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
             insurance_contracts::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+        }
+    }
+}
+
+impl From<InvariantError> for ContractError {
+    fn from(err: InvariantError) -> Self {
+        match err {
+            InvariantError::LiquidityViolation => ContractError::LiquidityViolation,
+            InvariantError::InvalidAmount => ContractError::InvalidAmount,
+            InvariantError::Overflow => ContractError::Overflow,
+            _ => ContractError::InvalidState,
         }
     }
 }
@@ -60,6 +78,37 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage()
         .persistent()
         .set(&PAUSED, &paused);
+}
+
+/// I1: Check liquidity preservation invariant
+/// Ensures: total_liquidity >= reserved_for_claims
+fn check_liquidity_invariant(env: &Env) -> Result<(), ContractError> {
+    let stats: (i128, i128, i128, u64) = env
+        .storage()
+        .persistent()
+        .get(&POOL_STATS)
+        .ok_or(ContractError::NotFound)?;
+
+    let reserved_total: i128 = env
+        .storage()
+        .persistent()
+        .get(&RESERVED_TOTAL)
+        .unwrap_or(0i128);
+
+    // I1: Liquidity Preservation: available_liquidity >= reserved_claims
+    if stats.0 < reserved_total {
+        return Err(ContractError::LiquidityViolation);
+    }
+
+    Ok(())
+}
+
+/// I4: Validate amount is positive and within safe range
+fn validate_amount(amount: i128) -> Result<(), ContractError> {
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+    Ok(())
 }
 
 #[contractimpl]
@@ -104,9 +153,9 @@ impl RiskPoolContract {
         }
 
         validate_address(&env, &provider)?;
-        if amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        
+        // I4: Amount Non-Negativity - amount must be positive
+        validate_amount(amount)?;
 
         let config: (Address, i128) = env
             .storage()
@@ -130,11 +179,11 @@ impl RiskPoolContract {
             .get(&POOL_STATS)
             .ok_or(ContractError::NotFound)?;
 
-        provider_info.0 += amount;
-        provider_info.1 += amount;
-
-        stats.0 += amount;
-        stats.2 += amount;
+        // Safe arithmetic with overflow check
+        provider_info.0 = provider_info.0.checked_add(amount).ok_or(ContractError::Overflow)?;
+        provider_info.1 = provider_info.1.checked_add(amount).ok_or(ContractError::Overflow)?;
+        stats.0 = stats.0.checked_add(amount).ok_or(ContractError::Overflow)?;
+        stats.2 = stats.2.checked_add(amount).ok_or(ContractError::Overflow)?;
 
         env.storage()
             .persistent()
@@ -142,6 +191,9 @@ impl RiskPoolContract {
         env.storage()
             .persistent()
             .set(&POOL_STATS, &stats);
+
+        // I1: Assert liquidity invariant holds after deposit
+        check_liquidity_invariant(&env)?;
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_deposited"), provider.clone()),
@@ -182,9 +234,8 @@ impl RiskPoolContract {
             return Err(ContractError::Paused);
         }
 
-        if amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        // I4: Amount Non-Negativity - amount must be positive
+        validate_amount(amount)?;
 
         if env
             .storage()
@@ -206,12 +257,13 @@ impl RiskPoolContract {
             .get(&RESERVED_TOTAL)
             .unwrap_or(0i128);
 
-        let available = stats.0 - reserved_total;
+        let available = stats.0.checked_sub(reserved_total).ok_or(ContractError::Overflow)?;
         if available < amount {
             return Err(ContractError::InsufficientFunds);
         }
 
-        let new_reserved_total = reserved_total + amount;
+        // Safe arithmetic for reservation
+        let new_reserved_total = reserved_total.checked_add(amount).ok_or(ContractError::Overflow)?;
 
         env.storage()
             .persistent()
@@ -219,6 +271,9 @@ impl RiskPoolContract {
         env.storage()
             .persistent()
             .set(&(CLAIM_RESERVATION, claim_id), &amount);
+
+        // I1: Assert liquidity invariant holds after reservation
+        check_liquidity_invariant(&env)?;
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_reserved"), claim_id),
@@ -269,9 +324,10 @@ impl RiskPoolContract {
             return Err(ContractError::InsufficientFunds);
         }
 
-        reserved_total -= amount;
-        stats.0 -= amount;
-        stats.1 += amount;
+        // Safe arithmetic for payout
+        reserved_total = reserved_total.checked_sub(amount).ok_or(ContractError::Overflow)?;
+        stats.0 = stats.0.checked_sub(amount).ok_or(ContractError::Overflow)?;
+        stats.1 = stats.1.checked_add(amount).ok_or(ContractError::Overflow)?;
 
         env.storage()
             .persistent()
@@ -282,6 +338,9 @@ impl RiskPoolContract {
         env.storage()
             .persistent()
             .set(&POOL_STATS, &stats);
+
+        // I1: Assert liquidity invariant holds after payout
+        check_liquidity_invariant(&env)?;
 
         env.events().publish(
             (Symbol::new(&env, "reserved_claim_payout"), claim_id),
@@ -301,9 +360,9 @@ impl RiskPoolContract {
         }
 
         validate_address(&env, &recipient)?;
-        if amount <= 0 {
-            return Err(ContractError::InvalidInput);
-        }
+        
+        // I4: Amount Non-Negativity - amount must be positive
+        validate_amount(amount)?;
 
         let mut stats: (i128, i128, i128, u64) = env
             .storage()
@@ -316,16 +375,21 @@ impl RiskPoolContract {
             .get(&RESERVED_TOTAL)
             .unwrap_or(0i128);
 
-        if stats.0 - reserved_total < amount {
+        let available = stats.0.checked_sub(reserved_total).ok_or(ContractError::Overflow)?;
+        if available < amount {
             return Err(ContractError::InsufficientFunds);
         }
 
-        stats.0 -= amount;
-        stats.1 += amount; // Track total payouts
+        // Safe arithmetic for payout
+        stats.0 = stats.0.checked_sub(amount).ok_or(ContractError::Overflow)?;
+        stats.1 = stats.1.checked_add(amount).ok_or(ContractError::Overflow)?;
 
         env.storage()
             .persistent()
             .set(&POOL_STATS, &stats);
+
+        // I1: Assert liquidity invariant holds after payout
+        check_liquidity_invariant(&env)?;
 
         // TODO: Actually transfer XLM tokens to recipient
         // This would require token contract integration
