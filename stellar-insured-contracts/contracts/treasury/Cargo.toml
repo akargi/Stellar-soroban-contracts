@@ -1,0 +1,11 @@
+[package]
+name = "treasury"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+soroban-sdk = { workspace = true }
+authorization = { path = "../authorization" }
+insurance-invariants = { path = "../invariants" }
+
+[lib]
