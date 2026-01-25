@@ -1,16 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracterror, symbol_short, Address, Env, Symbol};
 
 #[contract]
 pub struct RiskPoolContract;
 
-const ADMIN: Symbol = Symbol::short("ADMIN");
-const PAUSED: Symbol = Symbol::short("PAUSED");
-const CONFIG: Symbol = Symbol::short("CONFIG");
-const POOL_STATS: Symbol = Symbol::short("POOL_ST");
-const PROVIDER: Symbol = Symbol::short("PROVIDER");
-const RESERVED_TOTAL: Symbol = Symbol::short("RSV_TOT");
-const CLAIM_RESERVATION: Symbol = Symbol::short("CLM_RSV");
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const PAUSED: Symbol = symbol_short!("PAUSED");
+const CONFIG: Symbol = symbol_short!("CONFIG");
+const POOL_STATS: Symbol = symbol_short!("POOL_ST");
+const PROVIDER: Symbol = symbol_short!("PROVIDER");
+const RESERVED_TOTAL: Symbol = symbol_short!("RSV_TOT");
+const CLAIM_RESERVATION: Symbol = symbol_short!("CLM_RSV");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

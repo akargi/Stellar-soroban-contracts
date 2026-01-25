@@ -1,16 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracterror, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracterror, symbol_short, Address, Env, Symbol, Vec};
 
 #[contract]
 pub struct GovernanceContract;
 
-const ADMIN: Symbol = Symbol::short("ADMIN");
-const PAUSED: Symbol = Symbol::short("PAUSED");
-const CONFIG: Symbol = Symbol::short("CONFIG");
-const PROPOSAL: Symbol = Symbol::short("PROPOSAL");
-const PROPOSAL_COUNTER: Symbol = Symbol::short("PROP_CNT");
-const VOTER: Symbol = Symbol::short("VOTER");
-const PROPOSAL_LIST: Symbol = Symbol::short("PROP_LIST");
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const PAUSED: Symbol = symbol_short!("PAUSED");
+const CONFIG: Symbol = symbol_short!("CONFIG");
+const PROPOSAL: Symbol = symbol_short!("PROPOSAL");
+const PROPOSAL_COUNTER: Symbol = symbol_short!("PROP_CNT");
+const VOTER: Symbol = symbol_short!("VOTER");
+const PROPOSAL_LIST: Symbol = symbol_short!("PROP_LIST");
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ProposalStatus {
